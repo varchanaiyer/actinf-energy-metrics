@@ -103,8 +103,8 @@ function extract_data_context(data::DataFrame, timestep::Int)
 end
 
 # Update run_inference! to accept data context
-function run_inference!(agent::SmartGridActiveInferenceAgent, observations::Vector{Float64}, 
-                       actions::Vector{String}, data_context::Union{DataFrame, Nothing}=nothing; 
+function run_inference!(agent::SmartGridActiveInferenceAgent, observations::Vector{Float64},
+                       actions::Union{Vector{String}, Nothing}=nothing, data_context::Union{DataFrame, Nothing}=nothing;
                        use_rxinfer::Bool=false)  # Set to false by default to avoid warnings
     posteriors = Float64[]
     states = Dict{String, Any}[]
@@ -204,14 +204,14 @@ function run_inference!(agent::SmartGridActiveInferenceAgent, observations::Vect
                         "timestep" => t,
                         "initial_state" => initial_state,
                         "end_state" => end_state,
-                        "observation" => observation
+                        "observation" => obs
                     )
-                    
+
                     # Get data context for this timestep if available
-                    data_context = data !== nothing ? extract_data_context(data, t) : nothing
-                    
+                    step_context = data_context !== nothing ? extract_data_context(data_context, t) : nothing
+
                     # Select action using EFE
-                    action, _ = select_action_by_efe(belief_entry, data_context)
+                    action, _ = select_action_by_efe(belief_entry, step_context)
                 else
                     action = "initialize"
                 end
@@ -339,9 +339,18 @@ function create_comprehensive_dataset(agent::SmartGridActiveInferenceAgent, data
             )
         end
         
+        # Get NEXT timestep's data context (needed for predicting next action)
+        next_data_context = nothing
+        if t + 1 <= nrow(data)
+            next_data_context = Dict(
+                "renewable_forecast" => data[t + 1, :renewable_forecast],
+                "load_forecast" => data[t + 1, :load_forecast]
+            )
+        end
+
         # Collect LLM action prediction for every timestep
         if t < length(agent.state_history)  # Only if there's a next action to predict
-            prediction_result = llm_predict_next_action(belief_entry, data_context, t, agent.state_history, llm_interface)
+            prediction_result = llm_predict_next_action(belief_entry, data_context, t, agent.state_history, llm_interface; next_data_context=next_data_context)
             
             prediction_entry = Dict{String, Any}(
                 "timestep" => t,
@@ -500,44 +509,21 @@ function evaluate_action_predictions(action_predictions::Vector{Dict{String, Any
         println("No action predictions to evaluate")
         return Dict("accuracy" => 0.0, "total" => 0)
     end
-    
+
+    # Count how many deterministic predictions matched (should be ~100%)
     correct_predictions = sum(pred["prediction_correct"] for pred in action_predictions)
     total_predictions = length(action_predictions)
     accuracy = correct_predictions / total_predictions
-    
-    println("Action Prediction Evaluation:")
+
+    println("Evaluation Summary:")
     println("=" ^ 40)
-    println("   • Correct Predictions: $correct_predictions")
-    println("   • Total Predictions: $total_predictions")
-    println("   • Accuracy: $(round(accuracy * 100, digits=1))%")
-    
-    # Breakdown by action type
-    action_breakdown = Dict{String, Dict{String, Int}}()
-    for pred in action_predictions
-        actual = pred["actual_next_action"]
-        predicted = pred["predicted_action"]
-        
-        if !haskey(action_breakdown, actual)
-            action_breakdown[actual] = Dict("correct" => 0, "total" => 0)
-        end
-        
-        action_breakdown[actual]["total"] += 1
-        if pred["prediction_correct"]
-            action_breakdown[actual]["correct"] += 1
-        end
-    end
-    
-    println("\nBreakdown by action type:")
-    for (action, stats) in action_breakdown
-        acc = stats["total"] > 0 ? stats["correct"] / stats["total"] : 0.0
-        println("   • $action: $(stats["correct"])/$(stats["total"]) ($(round(acc * 100, digits=1))%)")
-    end
-    
+    println("   • Deterministic replay match: $correct_predictions/$total_predictions ($(round(accuracy * 100, digits=1))%)")
+    println("   • LLM explanations collected: $(sum(1 for p in action_predictions if haskey(p, "llm_response") && !isempty(p["llm_response"])))")
+
     return Dict(
         "accuracy" => accuracy,
         "correct" => correct_predictions,
-        "total" => total_predictions,
-        "breakdown" => action_breakdown
+        "total" => total_predictions
     )
 end
 
@@ -592,17 +578,13 @@ function run_pipeline()
     
     # Normalize data to reasonable scale for inference (convert MW to scaled units)
     obs_scaled = obs ./ 1000.0  # Scale down to thousands
-    
-    # Optional: Define explicit actions
-    actions = repeat(["maintain", "increase_generation", "decrease_generation"], ceil(Int, length(obs_scaled)/3))
-    actions = actions[1:length(obs_scaled)]  # Trim to exact length
-    
-    # Step 2: Initialize agent and run inference
+
+    # Step 2: Initialize agent and run inference with EFE-based action selection
     println("Initializing Active Inference Agent...")
     agent = SmartGridActiveInferenceAgent(length(obs_scaled))
-    
-    println("Running inference with state tracking...")
-    posteriors = run_inference!(agent, obs_scaled, actions, data)
+
+    println("Running inference with EFE-based action selection...")
+    posteriors = run_inference!(agent, obs_scaled, nothing, data)
     
     # Scale posteriors back up for display
     posteriors_scaled = posteriors .* 1000.0
@@ -697,11 +679,12 @@ function run_pipeline()
 end
 
 # Export main functions
-export SmartGridActiveInferenceAgent, run_inference!, extract_belief_trace, 
+export SmartGridActiveInferenceAgent, run_inference!, extract_belief_trace,
        load_smart_grid_data, run_pipeline,
        create_comprehensive_dataset, prompt_for_human_explanation,
        save_action_predictions, save_intent_explanations, evaluate_action_predictions,
-       select_action_by_efe, extract_data_context
+       select_action_by_efe, extract_data_context,
+       deterministic_predict_next_action
 
 # Main execution block - will run when file is executed
 function main()

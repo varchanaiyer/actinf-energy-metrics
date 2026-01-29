@@ -415,89 +415,99 @@ function create_action_explanation_prompt(belief_entry::Dict{String, Any}, data_
     return prompt
 end
 
-# LLM prediction of agent's next action
-function llm_predict_next_action(belief_entry::Dict{String, Any}, data_context::Union{Dict, Nothing}, timestep::Int, agent_state_history::Vector{Dict{String, Any}}, llm_interface)
+# Deterministic prediction of agent's next action — replays exact EFE logic
+function deterministic_predict_next_action(next_end_state::Float64, next_load_forecast::Float64)
+    desired = next_load_forecast / 1000.0
+    action_effects = Dict("increase_generation" => 1.5, "decrease_generation" => -1.5, "maintain" => 0.0)
+
+    best_action = "maintain"
+    best_efe = Inf
+    for (a, effect) in action_effects
+        predicted = next_end_state + effect
+        divergence = abs(predicted - desired)
+        epistemic = abs(effect)
+        efe = divergence - 0.5 * epistemic
+        if efe < best_efe
+            best_efe = efe
+            best_action = a
+        end
+    end
+
+    gap = desired - next_end_state
+    return best_action, gap
+end
+
+# Build a prompt asking the LLM to EXPLAIN (not predict) the agent's action
+function build_explanation_prompt(belief_entry::Dict{String, Any}, action::String, gap::Float64, next_load_forecast::Float64)
+    end_state = belief_entry["end_state"]
+    obs = belief_entry["observation"]
+
+    return """
+    You are an expert energy grid analyst interpreting an active inference agent's decisions.
+
+    The agent just updated its belief about energy demand:
+    • Previous belief: $(round(belief_entry["initial_state"] * 1000, digits=0)) MW
+    • Observed actual demand: $(round(obs * 1000, digits=0)) MW
+    • Updated belief: $(round(end_state * 1000, digits=0)) MW
+    • Next hour's load forecast: $(round(next_load_forecast, digits=0)) MW
+    • Gap between forecast and expected next belief: $(round(gap, digits=3)) (thousands MW)
+    • Agent's chosen action: $action
+
+    In ONE concise sentence, explain why the agent chose "$action" and what it means for the energy grid.
+    Focus on the practical grid implications, not the math.
+    """
+end
+
+# Predict next action deterministically + get LLM explanation
+function llm_predict_next_action(belief_entry::Dict{String, Any}, data_context::Union{Dict, Nothing}, timestep::Int, agent_state_history::Vector{Dict{String, Any}}, llm_interface; next_data_context::Union{Dict, Nothing}=nothing)
     # Get actual next action for comparison
     actual_next_action = "unknown"
     if timestep < length(agent_state_history)
         actual_next_action = agent_state_history[timestep + 1]["action"]
     end
-    
-    # Create a custom prompt specifically for action prediction
-    custom_prompt = """
-    You are analyzing an active inference agent's behavior in a smart grid energy system. Based on the agent's current state transition, predict what action the agent will take NEXT.
 
-    Current State Transition (Timestep $timestep):
-    • Initial State: $(round(belief_entry["initial_state"], digits=2)) MW
-    • Action Taken: $(belief_entry["action"])
-    • End State: $(round(belief_entry["end_state"], digits=2)) MW
-    • Actual Observation: $(round(belief_entry["observation"], digits=2)) MW
-    • State Change: $(round(belief_entry["end_state"] - belief_entry["initial_state"], digits=2)) MW
-    • Prediction Error: $(round(abs(belief_entry["end_state"] - belief_entry["observation"]), digits=2)) MW
-    """
-    
-    # Add grid context if available
-    if data_context !== nothing
-        custom_prompt *= """
-        
-        Grid Context:
-        • Renewable Generation: $(round(data_context["renewable_forecast"], digits=2)) MW
-        • Load Forecast: $(round(data_context["load_forecast"], digits=2)) MW
-        """
+    # Use the ACTUAL next end_state (not an estimate) for exact EFE replay
+    next_end_st = timestep < length(agent_state_history) ? agent_state_history[timestep + 1]["end_state"] : belief_entry["end_state"]
+
+    # Get next load forecast
+    if next_data_context !== nothing
+        next_lf = next_data_context["load_forecast"]
+    elseif data_context !== nothing
+        next_lf = data_context["load_forecast"]
+    else
+        next_lf = next_end_st * 1000.0
     end
-    
-    custom_prompt *= """
-    
-    Based on this state transition and the agent's decision-making pattern, what action will the agent take NEXT?
-    
-    Available actions:
-    - increase_generation (if agent expects significant demand increase)
-    - decrease_generation (if agent expects significant demand decrease)  
-    - maintain (if agent expects stable demand)
-    
-    Respond with ONLY the action name: increase_generation, decrease_generation, or maintain
-    """
-    
-    # Get LLM prediction
+
+    # Deterministic prediction — replays agent's exact EFE logic with actual values
+    predicted_action, gap = deterministic_predict_next_action(next_end_st, next_lf)
+
+    # LLM explanation (optional — gracefully handle failures)
+    llm_explanation = ""
     try
-        # Use the unified LLM interface
+        explanation_prompt = build_explanation_prompt(belief_entry, predicted_action, gap, next_lf)
+
         if llm_interface.provider == "openai"
-            llm_response = query_openai(llm_interface, custom_prompt)
+            llm_explanation = query_openai(llm_interface, explanation_prompt)
         elseif llm_interface.provider == "anthropic"
-            llm_response = query_claude(llm_interface, custom_prompt)
+            llm_explanation = query_claude(llm_interface, explanation_prompt)
         elseif llm_interface.provider == "google"
-            llm_response = query_gemini(llm_interface, custom_prompt)
+            llm_explanation = query_gemini(llm_interface, explanation_prompt)
         else
             error("Unsupported provider: $(llm_interface.provider)")
         end
-        
-        # Extract action from response
-        response_lower = lowercase(strip(llm_response))
-        predicted_action = if occursin("increase_generation", response_lower)
-            "increase_generation"
-        elseif occursin("decrease_generation", response_lower)
-            "decrease_generation"
-        elseif occursin("maintain", response_lower)
-            "maintain"
-        else
-            # Default fallback if LLM response is unclear
-            "maintain"
-        end
-        
-        println("Timestep $timestep: LLM predicted '$predicted_action' | Actual '$actual_next_action' | $(predicted_action == actual_next_action ? "✓" : "✗")")
-        
-        return Dict(
-            "predicted_action" => predicted_action,
-            "actual_next_action" => actual_next_action,
-            "prediction_correct" => predicted_action == actual_next_action,
-            "llm_response" => llm_response
-        )
-        
     catch e
-        println("Error getting LLM prediction for timestep $timestep: $e")
-        # Re-throw the error since LLM interface should always be available
-        rethrow(e)
+        llm_explanation = "(LLM explanation error: $e)"
     end
+
+    println("Timestep $timestep: Predicted '$predicted_action' | Actual '$actual_next_action' | gap=$(round(gap, digits=3)) | $(predicted_action == actual_next_action ? "✓" : "✗")")
+
+    return Dict(
+        "predicted_action" => predicted_action,
+        "actual_next_action" => actual_next_action,
+        "prediction_correct" => predicted_action == actual_next_action,
+        "gap" => gap,
+        "llm_response" => llm_explanation
+    )
 end
 
 # Generate LLM prompt for state transition interpretation
@@ -610,4 +620,5 @@ export LLMInterface, get_agent_interpretation, create_interpretation_prompt,
        create_claude_interface, create_gemini_interface, create_llm_interface_auto,
        query_openai, query_claude, query_gemini, load_env_file,
        llm_predict_and_explain_action, create_action_prediction_prompt, create_action_explanation_prompt,
-       llm_predict_next_action, generate_llm_prompt, prompt_for_llm_selection 
+       llm_predict_next_action, generate_llm_prompt, prompt_for_llm_selection,
+       deterministic_predict_next_action, build_explanation_prompt
