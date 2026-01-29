@@ -16,15 +16,13 @@ We replaced this meaningless metric with three that actually measure whether the
 
 ## Results
 
-![Agent Evaluation Summary](fig5_summary.png)
+*Run `run_actinf_colab.py` to generate all figures (`fig1`–`fig5`).*
 
 ### Metric 1: Belief Tracking — 91.9% (Agent MAE: 403 MW)
 
 **What it measures:** How accurately does the agent's internal belief match real electricity demand?
 
 **Result:** The agent's belief is off by only **403 MW** on average — out of a grid running at 35,000-70,000 MW. That's less than 1% error. For context, 403 MW is roughly one mid-sized power plant.
-
-![Belief Tracking: Agent vs Raw Forecast](fig2_belief_quality.png)
 
 ### Metric 2: Forecast Improvement — 84.6% (Forecast MAE: 2,613 MW)
 
@@ -35,8 +33,6 @@ We replaced this meaningless metric with three that actually measure whether the
 ### Metric 3: Action Appropriateness — 60.1%
 
 **What it measures:** When the agent says "increase generation," does demand actually go up in the next hour? When it says "decrease," does demand actually fall?
-
-![Action Appropriateness](fig4_action_appropriateness.png)
 
 **Result:** 60.1% of the agent's actions matched the actual direction of demand change. This is a moderate score. The breakdown:
 
