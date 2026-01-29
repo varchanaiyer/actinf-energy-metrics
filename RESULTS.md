@@ -16,7 +16,13 @@ We replaced this meaningless metric with three that actually measure whether the
 
 ## Results
 
-*Run `run_actinf_colab.py` to generate all figures (`fig1`–`fig5`).*
+### Summary Dashboard
+
+![Agent Evaluation Summary](4.png)
+
+The summary dashboard shows all three evaluation metrics side by side. Belief Tracking and Forecast Improvement score above 84%, indicating the agent's core inference engine is strong. Action Appropriateness at 60.1% is the weakest metric and the main area for improvement.
+
+---
 
 ### Metric 1: Belief Tracking — 91.9% (Agent MAE: 403 MW)
 
@@ -24,21 +30,37 @@ We replaced this meaningless metric with three that actually measure whether the
 
 **Result:** The agent's belief is off by only **403 MW** on average — out of a grid running at 35,000-70,000 MW. That's less than 1% error. For context, 403 MW is roughly one mid-sized power plant.
 
+![Belief Tracking: Agent vs Raw Forecast](1.png)
+
+This rolling MAE chart compares the agent's error (blue, ~400 MW) against the raw day-ahead forecast error (orange, ~2,600 MW) over all 200 timesteps. The green shaded area represents the agent's improvement. The agent consistently outperforms the forecast across the entire period — the advantage is not concentrated in any single window but holds steady throughout.
+
+---
+
 ### Metric 2: Forecast Improvement — 84.6% (Forecast MAE: 2,613 MW)
 
 **What it measures:** Is the agent smarter than just using the raw grid forecast?
 
-**Result:** The raw day-ahead forecast from the grid operator is off by **2,613 MW** on average. The agent reduces that error by **84.6%** — from 2,613 MW down to 403 MW. The agent adds substantial value over the naive baseline. The rolling MAE chart shows this advantage is consistent across all 200 hours, not just an average that hides bad periods.
+**Result:** The raw day-ahead forecast from the grid operator is off by **2,613 MW** on average. The agent reduces that error by **84.6%** — from 2,613 MW down to 403 MW. The agent adds substantial value over the naive baseline.
+
+---
 
 ### Metric 3: Action Appropriateness — 60.1%
 
 **What it measures:** When the agent says "increase generation," does demand actually go up in the next hour? When it says "decrease," does demand actually fall?
+
+![Action Appropriateness](3.png)
+
+The left pie chart shows that 60.1% of actions were appropriate (green) while 39.9% were mismatched (orange). The right bar chart breaks this down by action type: `increase_generation` is the most accurate at 70%, while `decrease_generation` (58%) and `maintain` (56%) are closer to chance.
 
 **Result:** 60.1% of the agent's actions matched the actual direction of demand change. This is a moderate score. The breakdown:
 
 - **increase_generation: 70%** — When the agent ramps up, demand usually is rising. Good.
 - **decrease_generation: 58%** — When the agent ramps down, demand falls slightly more than half the time. The agent is over-eager to decrease (150 out of 200 timesteps are decrease actions).
 - **maintain: 56%** — Demand was stable about half the time when the agent held steady.
+
+![Agent Action Distribution](2.png)
+
+The action distribution chart reveals the root cause of the moderate appropriateness score: the agent overwhelmingly selects `decrease_generation` (150 out of 200 timesteps), with only 33 `increase_generation` and 16 `maintain` actions. This heavy bias means the agent is often decreasing generation even when demand is rising, dragging down the overall appropriateness score.
 
 The 60% score reveals that the agent's **action selection could be improved** — it heavily favors `decrease_generation` even when demand is about to rise. This is a real finding about the agent's EFE parameters, not an artifact of a bad metric.
 
