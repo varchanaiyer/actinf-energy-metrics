@@ -24,7 +24,7 @@ if USE_GOOGLE_DRIVE:
     PROJECT_DIR = "/content/drive/MyDrive/actinf_interp_copy"
 else:
     # If uploaded directly to the Colab runtime filesystem
-    PROJECT_DIR = "/content/actinf_interp_copy"
+    PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 os.chdir(PROJECT_DIR)
 print(f"Working directory: {os.getcwd()}")
@@ -34,12 +34,26 @@ print(f"Files: {os.listdir('.')}")
 import sqlite3, json, math, requests
 import numpy as np
 
+# Combined explanation scoring dependencies (install in Colab with:
+#   !pip install sentence-transformers bert-score)
+try:
+    from sentence_transformers import SentenceTransformer, util as st_util
+    _SBERT_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+    HAS_SBERT = True
+except ImportError:
+    HAS_SBERT = False
+    _SBERT_MODEL = None
+
+import re
+
 SQLITE_PATH   = os.path.join(PROJECT_DIR, "time_series.sqlite")
 COUNTRY        = "DE"
 DATA_LIMIT     = 200
 LLM_PROVIDER   = "openrouter"          # "openrouter" | "openai" | "anthropic" | "google"
-API_KEY        = ""  # Set your API key here or use environment variables
-MODEL_NAME     = "openai/gpt-4o"       # OpenRouter model ID (e.g. "anthropic/claude-3.5-sonnet", "google/gemini-2.0-flash-exp")
+API_KEY        = "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"
+MODEL_NAME     = "openai/gpt-4o"       # OpenRouter model ID
+GPT_MODEL      = "openai/gpt-4o"
+CLAUDE_MODEL   = "anthropic/claude-sonnet-4"
 
 # Fallback: read key from environment
 if not API_KEY:
@@ -236,6 +250,75 @@ def _query_google(prompt: str) -> str:
     r.raise_for_status()
     return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
+def query_openrouter_model(prompt: str, model: str, max_tokens: int = 100) -> str:
+    """Query a specific model via OpenRouter."""
+    r = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": "You are an expert energy grid analyst."},
+                {"role": "user",   "content": prompt},
+            ],
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def query_llm_judge(explanation: str, agent_state: dict, data_context: dict, judge_model: str) -> float:
+    """
+    Use an LLM as judge to rate an explanation on a 1-5 scale.
+    Returns normalized score (0-1).
+    """
+    obs_mw = agent_state["observation"] * 1000
+    end_mw = agent_state["end_state"] * 1000
+    init_mw = agent_state["initial_state"] * 1000
+    fc_mw = data_context["load_forecast"]
+    action = agent_state["action"]
+
+    judge_prompt = f"""Rate the following explanation of an energy grid agent's decision.
+
+Agent state:
+• Previous belief: {init_mw:.0f} MW
+• Observed demand: {obs_mw:.0f} MW
+• Updated belief: {end_mw:.0f} MW
+• Load forecast: {fc_mw:.0f} MW
+• Action taken: {action}
+
+Explanation to evaluate:
+"{explanation}"
+
+Rate on three criteria (1-5 each):
+1. ACCURACY: Does the explanation correctly describe the agent's action and the grid state?
+2. COMPLETENESS: Does it mention the key facts (action, demand values, forecast)?
+3. CLARITY: Is it easy for a grid operator to understand?
+
+Reply with ONLY three numbers separated by commas, e.g.: 4,3,5"""
+
+    try:
+        response = query_openrouter_model(judge_prompt, judge_model, max_tokens=20)
+        # Parse numbers from response
+        numbers = re.findall(r'[1-5]', response)
+        if len(numbers) >= 3:
+            scores = [int(n) for n in numbers[:3]]
+            return np.mean(scores) / 5.0  # normalize to 0-1
+        elif len(numbers) >= 1:
+            return int(numbers[0]) / 5.0
+        else:
+            return 0.5  # fallback
+    except Exception as e:
+        print(f"      Judge error ({judge_model}): {e}")
+        return 0.5
+
+
 # ── 4. DETERMINISTIC PREDICTION + LLM EXPLANATION ─────────────────────────
 
 def deterministic_predict_action(next_end_state: float, next_load_forecast: float) -> tuple:
@@ -368,11 +451,19 @@ def main():
         pct = s["correct"] / s["total"] * 100 if s["total"] else 0
         print(f"    {act}: {s['correct']}/{s['total']} ({pct:.1f}%)")
 
-    # ── METRIC 3: LLM Explanation Quality (if API key set) ────────────────────
+    # ── METRIC 3: LLM Explanation Quality — Combined Scoring Pipeline ────────
+    # Three layers:
+    #   Layer 1 (rubric):     Factual checks — action, direction, numbers (0-5, normalized to 0-1)
+    #   Layer 2 (embedding):  Cosine similarity vs gold standard (0-1)
+    #   Layer 3 (LLM-as-Judge): Cross-model judging (0-1)
+    # Combined = 0.4 * rubric + 0.3 * embedding + 0.3 * llm_judge
     explanations = []
     explanation_scores = []
     if API_KEY:
-        print("\n  METRIC 3: LLM Explanation Quality")
+        print("\n  METRIC 3: LLM Explanation Quality (Combined Scoring)")
+        print(f"    Embedding model: {'all-MiniLM-L6-v2' if HAS_SBERT else 'NOT INSTALLED'}")
+        print(f"    LLM-as-Judge:    GPT-4o + Claude (cross-judging via OpenRouter)")
+        print(f"    Explainer models: {GPT_MODEL} and {CLAUDE_MODEL}")
         sample_indices = list(range(0, N - 1, max(1, (N - 1) // 20)))  # ~20 samples
         for t in sample_indices:
             entry = state_history[t]
@@ -381,34 +472,116 @@ def main():
                 continue
             nctx = {"load_forecast": data[t]["load_forecast"]}
             gap = data[t]["load_forecast"] / 1000.0 - entry["end_state"]
+            prompt = build_explanation_prompt(entry, action, gap, nctx)
+
+            # Get explanations from both models
             try:
-                prompt = build_explanation_prompt(entry, action, gap, nctx)
-                explanation = query_llm(prompt)
+                explanation_gpt = query_openrouter_model(prompt, GPT_MODEL)
             except Exception as e:
-                explanation = f"(error: {e})"
+                print(f"    T{t+1}: GPT explanation error: {e}")
+                explanation_gpt = f"(error: {e})"
+            try:
+                explanation_claude = query_openrouter_model(prompt, CLAUDE_MODEL)
+            except Exception as e:
+                print(f"    T{t+1}: Claude explanation error: {e}")
+                explanation_claude = f"(error: {e})"
+
+            if explanation_gpt.startswith("(error") and explanation_claude.startswith("(error"):
                 continue
 
-            # Auto-score: does explanation mention the correct action?
-            mentions_action = action.replace("_", " ") in explanation.lower() or action in explanation.lower()
-            # Does it mention direction correctly?
-            demand_rising = entry["observation"] > entry["initial_state"]
-            mentions_direction = ("ris" in explanation.lower() or "increas" in explanation.lower()) if demand_rising else ("fall" in explanation.lower() or "decreas" in explanation.lower() or "drop" in explanation.lower())
+            # Score each model's explanation
+            for model_label, explanation, judge_model in [
+                ("GPT", explanation_gpt, CLAUDE_MODEL),      # Claude judges GPT
+                ("Claude", explanation_claude, GPT_MODEL),    # GPT judges Claude
+            ]:
+                if explanation.startswith("(error"):
+                    continue
 
-            score = int(mentions_action) + int(mentions_direction)
-            explanation_scores.append(score)
-            explanations.append({
-                "timestep": t + 1,
-                "action": action,
-                "explanation": explanation,
-                "mentions_action": mentions_action,
-                "mentions_direction": mentions_direction,
-                "score": score,
-            })
-            print(f"    T{t+1}: action={mentions_action}, direction={mentions_direction} → {score}/2")
+                # ── Layer 1: Rubric ──
+                low = explanation.lower()
+                demand_rising = entry["observation"] > entry["initial_state"]
+                obs_mw_val = entry["observation"] * 1000
+                end_mw_val = entry["end_state"] * 1000
+                fc_mw_val = data[t]["load_forecast"]
+
+                checks = {
+                    "mentions_action": (action.replace("_", " ") in low or action in low),
+                    "mentions_direction": (
+                        ("ris" in low or "increas" in low or "higher" in low or "up" in low)
+                        if demand_rising else
+                        ("fall" in low or "decreas" in low or "drop" in low or "lower" in low or "down" in low)
+                    ),
+                    "mentions_demand_value": any(
+                        str(int(round(v, -2))) in low or str(int(round(v, -1))) in low
+                        for v in [obs_mw_val, end_mw_val] if v > 0
+                    ),
+                    "mentions_forecast": (
+                        str(int(round(fc_mw_val, -2))) in low or
+                        str(int(round(fc_mw_val, -1))) in low or
+                        "forecast" in low
+                    ),
+                    "correct_implication": (
+                        (action == "increase_generation" and ("shortage" in low or "deficit" in low or "rising" in low or "need" in low or "ramp" in low)) or
+                        (action == "decrease_generation" and ("surplus" in low or "excess" in low or "falling" in low or "reduce" in low or "curtail" in low)) or
+                        (action == "maintain" and ("stable" in low or "balanced" in low or "steady" in low))
+                    ),
+                }
+                rubric_norm = sum(checks.values()) / 5.0
+
+                # ── Layer 2: Embedding similarity ──
+                direction_word = "rising" if demand_rising else "falling"
+                action_phrase = action.replace("_", " ")
+                gold_standard = (
+                    f"The agent chose to {action_phrase} because demand is {direction_word}, "
+                    f"with actual demand at {obs_mw_val:.0f} MW and the forecast at {fc_mw_val:.0f} MW. "
+                    f"The agent's updated belief of {end_mw_val:.0f} MW "
+                    f"{'falls short of' if gap > 0 else 'exceeds'} the forecast, "
+                    f"so {action_phrase} is the appropriate response to align generation with expected demand."
+                )
+                embedding_sim = 0.0
+                if HAS_SBERT:
+                    emb = _SBERT_MODEL.encode([explanation, gold_standard], convert_to_tensor=True)
+                    embedding_sim = float(st_util.cos_sim(emb[0], emb[1])[0][0])
+                    embedding_sim = max(0.0, embedding_sim)
+
+                # ── Layer 3: LLM-as-Judge (cross-model) ──
+                judge_score = query_llm_judge(explanation, entry, nctx, judge_model)
+
+                # ── Combined ──
+                if HAS_SBERT:
+                    combined = 0.4 * rubric_norm + 0.3 * embedding_sim + 0.3 * judge_score
+                else:
+                    combined = 0.5 * rubric_norm + 0.5 * judge_score
+
+                explanation_scores.append(combined)
+                explanations.append({
+                    "timestep": t + 1,
+                    "action": action,
+                    "model": model_label,
+                    "explanation": explanation,
+                    "gold_standard": gold_standard,
+                    "rubric_checks": {k: bool(v) for k, v in checks.items()},
+                    "rubric_score": rubric_norm,
+                    "embedding_similarity": round(embedding_sim, 4),
+                    "judge_score": round(judge_score, 4),
+                    "combined_score": round(combined, 4),
+                })
+                print(f"    T{t+1} [{model_label:6s}]: rubric={rubric_norm:.2f}  embed={embedding_sim:.2f}  judge={judge_score:.2f}  → combined={combined:.2f}")
 
         if explanation_scores:
-            avg_score = np.mean(explanation_scores)
-            print(f"    Average explanation quality: {avg_score:.2f}/2.0")
+            avg = np.mean(explanation_scores)
+            print(f"\n    Average combined explanation quality: {avg:.2f} (0-1 scale, {avg*100:.1f}%)")
+            gpt_entries = [e for e in explanations if e["model"] == "GPT"]
+            claude_entries = [e for e in explanations if e["model"] == "Claude"]
+            if gpt_entries:
+                avg_gpt = np.mean([e["combined_score"] for e in gpt_entries])
+                print(f"    GPT-4o average:  {avg_gpt:.2f} ({avg_gpt*100:.1f}%)")
+            if claude_entries:
+                avg_claude = np.mean([e["combined_score"] for e in claude_entries])
+                print(f"    Claude average:  {avg_claude:.2f} ({avg_claude*100:.1f}%)")
+            print(f"    Components — rubric: {np.mean([e['rubric_score'] for e in explanations]):.2f}, "
+                  f"embedding: {np.mean([e['embedding_similarity'] for e in explanations]):.2f}, "
+                  f"judge: {np.mean([e['judge_score'] for e in explanations]):.2f}")
     else:
         print("\n  METRIC 3: LLM Explanation Quality — skipped (no API key)")
         print("    Set API_KEY to enable LLM explanations.")
@@ -545,7 +718,7 @@ def plot_all(data, state_history, explanations, results):
 
     if results.get("explanations"):
         metric_names.append("LLM Explanation\nQuality")
-        avg_expl = np.mean([e["score"] for e in results["explanations"]]) / 2.0 * 100
+        avg_expl = np.mean([e["combined_score"] for e in results["explanations"]]) * 100
         metric_values.append(avg_expl)
         bar_colors_5.append("#9C27B0")
 
@@ -559,6 +732,118 @@ def plot_all(data, state_history, explanations, results):
     fig5.tight_layout()
     fig5.savefig(os.path.join(PROJECT_DIR, "fig5_summary.png"), dpi=150)
     plt.show()
+
+    # ── Figure 6: LLM Explanation Quality Table ───────────────────────────
+    expl_data = results.get("explanations", [])
+    if expl_data:
+        # Build table rows with model column
+        table_rows = []
+        for e in expl_data:
+            table_rows.append([
+                f"T{e['timestep']}",
+                e.get("model", "—"),
+                e["action"].replace("_", " "),
+                f"{e['rubric_score']:.2f}",
+                f"{e['embedding_similarity']:.2f}",
+                f"{e.get('judge_score', 0):.2f}",
+                f"{e['combined_score']:.2f}",
+            ])
+        # Summary row
+        avg_r = np.mean([e["rubric_score"] for e in expl_data])
+        avg_e = np.mean([e["embedding_similarity"] for e in expl_data])
+        avg_j = np.mean([e.get("judge_score", 0) for e in expl_data])
+        avg_c = np.mean([e["combined_score"] for e in expl_data])
+        table_rows.append([
+            "AVG", "—", "—",
+            f"{avg_r:.2f}", f"{avg_e:.2f}", f"{avg_j:.2f}", f"{avg_c:.2f}",
+        ])
+
+        col_labels = ["Timestep", "Model", "Action", "Rubric\n(40%)", "Embedding\n(30%)",
+                       "LLM Judge\n(30%)", "Combined"]
+        n_rows = len(table_rows)
+        fig6_h = max(3, 0.45 * n_rows + 1.5)
+        fig6, ax6 = plt.subplots(figsize=(12, fig6_h))
+        ax6.axis("off")
+        ax6.set_title(f"LLM Explanation Quality — Combined Scoring ({avg_c*100:.1f}%)",
+                       fontsize=12, fontweight="bold", pad=12)
+
+        # Color cells
+        cell_colors = []
+        for i, row in enumerate(table_rows):
+            row_colors = ["#f5f5f5"] * 3  # timestep + model + action
+            for val_str in row[3:]:
+                try:
+                    v = float(val_str)
+                    if v >= 0.7:
+                        row_colors.append("#C8E6C9")
+                    elif v >= 0.4:
+                        row_colors.append("#FFF9C4")
+                    else:
+                        row_colors.append("#FFCDD2")
+                except ValueError:
+                    row_colors.append("#f5f5f5")
+            if i == len(table_rows) - 1:
+                row_colors = ["#E0E0E0"] * len(row)
+            cell_colors.append(row_colors)
+
+        tbl = ax6.table(cellText=table_rows, colLabels=col_labels,
+                         cellColours=cell_colors, cellLoc="center",
+                         colColours=["#1565C0"] * len(col_labels), loc="center")
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8)
+        tbl.scale(1.0, 1.4)
+        for (r, c), cell in tbl.get_celld().items():
+            if r == 0:
+                cell.set_text_props(color="white", fontweight="bold")
+            if r == len(table_rows):
+                cell.set_text_props(fontweight="bold")
+
+        fig6.tight_layout()
+        fig6.savefig(os.path.join(PROJECT_DIR, "fig6_explanation_quality.png"), dpi=150,
+                      bbox_inches="tight")
+        plt.show()
+
+    # ── Figure 7: GPT vs Claude Comparison ─────────────────────────────────
+    gpt_entries = [e for e in expl_data if e.get("model") == "GPT"]
+    claude_entries = [e for e in expl_data if e.get("model") == "Claude"]
+    if gpt_entries and claude_entries:
+        metrics = ["Rubric", "Embedding", "LLM Judge", "Combined"]
+        gpt_vals = [
+            np.mean([e["rubric_score"] for e in gpt_entries]),
+            np.mean([e["embedding_similarity"] for e in gpt_entries]),
+            np.mean([e.get("judge_score", 0) for e in gpt_entries]),
+            np.mean([e["combined_score"] for e in gpt_entries]),
+        ]
+        claude_vals = [
+            np.mean([e["rubric_score"] for e in claude_entries]),
+            np.mean([e["embedding_similarity"] for e in claude_entries]),
+            np.mean([e.get("judge_score", 0) for e in claude_entries]),
+            np.mean([e["combined_score"] for e in claude_entries]),
+        ]
+
+        x = np.arange(len(metrics))
+        width = 0.35
+        fig7, ax7 = plt.subplots(figsize=(9, 5))
+        bars_gpt = ax7.bar(x - width/2, gpt_vals, width, label="GPT-4o", color="#1565C0")
+        bars_claude = ax7.bar(x + width/2, claude_vals, width, label="Claude", color="#9C27B0")
+        ax7.set_ylabel("Score (0-1)")
+        ax7.set_title("GPT-4o vs Claude: Explanation Quality Comparison")
+        ax7.set_xticks(x)
+        ax7.set_xticklabels(metrics)
+        ax7.set_ylim(0, 1.1)
+        ax7.legend()
+        ax7.grid(True, alpha=0.3, axis="y")
+
+        for bar in bars_gpt:
+            ax7.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                     f"{bar.get_height():.2f}", ha="center", fontsize=9, fontweight="bold")
+        for bar in bars_claude:
+            ax7.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                     f"{bar.get_height():.2f}", ha="center", fontsize=9, fontweight="bold")
+
+        fig7.tight_layout()
+        fig7.savefig(os.path.join(PROJECT_DIR, "fig7_gpt_vs_claude.png"), dpi=150)
+        plt.show()
 
     print(f"\nAll figures saved to {PROJECT_DIR}/")
 
